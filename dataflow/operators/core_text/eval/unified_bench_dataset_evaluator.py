@@ -11,6 +11,7 @@ from math_verify import parse, verify
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from tqdm import tqdm
 
 from dataflow import get_logger
 from dataflow.core import OperatorABC
@@ -369,7 +370,14 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
     # -----------------------------
     # LLM loglikelihood 适配（尽量兼容不同 serving 实现）
     # -----------------------------
-    def _ll_batch(self, prompts: List[str], continuations: List[str]) -> Optional[List[float]]:
+    def _ll_batch(
+        self,
+        prompts: List[str],
+        continuations: List[str],
+        *,
+        show_progress: bool = False,
+        desc: str = "Computing loglikelihood",
+    ) -> Optional[List[float]]:
         if self.llm_serving is None:
             return None
 
@@ -413,7 +421,7 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
             loaded_id = getattr(self, "_ll_hf_model_id", None)
             if tokenizer is None or model is None or loaded_id != model_id:
                 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code)
-                model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code)
+                model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code, attn_implementation="eager")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 model.to(device)
                 model.eval()
@@ -436,7 +444,15 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
             def _safe_ids(text: str) -> List[int]:
                 return tokenizer(text, add_special_tokens=False).input_ids
 
-            for start in range(0, len(prompts), batch_size):
+            total_batches = (len(prompts) + batch_size - 1) // batch_size if len(prompts) else 0
+            for start in tqdm(
+                range(0, len(prompts), batch_size),
+                total=total_batches,
+                desc=desc,
+                unit="batch",
+                disable=(not show_progress),
+                leave=False,
+            ):
                 ps = ["" if p is None else str(p) for p in prompts[start:start + batch_size]]
                 cs = ["" if c is None else str(c) for c in continuations[start:start + batch_size]]
 
@@ -518,7 +534,7 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
             loaded_id = getattr(self, "_ppl_hf_model_id", None)
             if tokenizer is None or model is None or loaded_id != model_id:
                 tokenizer = AutoTokenizer.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code)
-                model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code)
+                model = AutoModelForCausalLM.from_pretrained(model_id, cache_dir=hf_cache_dir, trust_remote_code=trust_remote_code, attn_implementation="eager")
                 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 model.to(device)
                 model.eval()
@@ -535,7 +551,8 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
             ppls: List[float] = []
             max_len = getattr(getattr(model, "config", None), "max_position_embeddings", None)
 
-            for start in range(0, len(texts), batch_size):
+            total_batches = (len(texts) + batch_size - 1) // batch_size if len(texts) else 0
+            for start in tqdm(range(0, len(texts), batch_size), total=total_batches, desc="Computing perplexity", unit="batch"):
                 batch_texts = ["" if t is None else str(t) for t in texts[start:start + batch_size]]
                 enc = tokenizer(
                     batch_texts,
@@ -1075,7 +1092,7 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
         # 优先：loglikelihood
         if metric_type == "ll_choice_acc" and self.llm_serving is not None:
             # 批量做：每行要对 choices 逐个算 ll，先实现清晰版（你后面可优化 batching）
-            for idx, row in df.iterrows():
+            for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating ll_choice_acc", unit="sample"):
                 q = row[question_col]
                 choices = row[choices_col]
                 label = row[label_col]
@@ -1111,13 +1128,17 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
                     continue
 
                 prompts = [prompt] * len(choices)
-                conts = []
-                for c in choices:
-                    c_str = str(c)
-                    # 常见做法：continuation 前补空格，避免直接拼在 Answer: 后面太粘连
-                    conts.append((" " + c_str) if (len(prompt) > 0 and not prompt.endswith((" ", "\n"))) else c_str)
 
-                lls = self._ll_batch(prompts, conts)
+                # MMLU/单选的标准做法：在同一个 prompt 下，只比较输出选项标签（A/B/C/...）的 loglikelihood。
+                # 不要比较输出整段选项文本的 loglikelihood，否则会对长选项产生长度惩罚，导致结果与官方评测差很多。
+                letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                conts: List[str] = []
+                for i in range(len(choices)):
+                    tag = letters[i] if i < len(letters) else str(i)
+                    # 常见做法：continuation 前补空格，避免直接拼在 Answer: 后面太粘连
+                    conts.append((" " + tag) if (len(prompt) > 0 and not prompt.endswith((" ", "\n"))) else tag)
+
+                lls = self._ll_batch(prompts, conts, show_progress=False)
                 if lls is None:
                     df.at[idx, output_eval_valid_key] = False
                     df.at[idx, output_eval_error_key] = "ll_unavailable"
@@ -1305,7 +1326,7 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
         output_eval_score_key = self.output_eval_score_key
 
         # 默认：pairwise_ll_winrate
-        for idx, row in df.iterrows():
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Evaluating pairwise ll", unit="sample"):
             q = row[question_col]
             better = row[better_col]
             rej = row[rejected_col]
@@ -1332,7 +1353,7 @@ class UnifiedBenchDatasetEvaluator(OperatorABC):
             conts.append((" " + better_s) if (len(prompt) > 0 and not prompt.endswith((" ", "\n"))) else better_s)
             conts.append((" " + rej_s) if (len(prompt) > 0 and not prompt.endswith((" ", "\n"))) else rej_s)
 
-            lls = self._ll_batch(prompts, conts)
+            lls = self._ll_batch(prompts, conts, show_progress=False)
             if lls is None or len(lls) != 2:
                 df.at[idx, output_eval_valid_key] = False
                 df.at[idx, output_eval_error_key] = "ll_unavailable"
